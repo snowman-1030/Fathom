@@ -7,8 +7,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Fathom API base URL
-const FATHOM_API_BASE = 'https://api.fathom.video/v1';
+// Fathom API base URL (configurable via environment variable)
+const FATHOM_API_BASE = process.env.FATHOM_API_BASE || 'https://api.fathom.video/v1';
 
 /**
  * Make a request to the Fathom API
@@ -20,23 +20,54 @@ async function fathomRequest(endpoint, options = {}) {
   }
 
   const url = `${FATHOM_API_BASE}${endpoint}`;
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
-  });
+  
+  try {
+    console.log(`Making request to: ${url}`);
+    const response = await fetch(url, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        ...options.headers,
+      },
+    });
 
-  if (!response.ok) {
-    const error = new Error(`Fathom API error: ${response.status} ${response.statusText}`);
-    error.status = response.status;
-    error.statusCode = response.status;
+    if (!response.ok) {
+      let errorBody = '';
+      try {
+        errorBody = await response.text();
+      } catch (e) {
+        // Ignore error reading body
+      }
+      
+      const error = new Error(`Fathom API error: ${response.status} ${response.statusText}. ${errorBody}`);
+      error.status = response.status;
+      error.statusCode = response.status;
+      error.body = errorBody;
+      throw error;
+    }
+
+    return response.json();
+  } catch (error) {
+    // Enhance error with more details
+    if (error.message && !error.message.includes('Fathom API error')) {
+      console.error(`Fetch error details:`, {
+        message: error.message,
+        stack: error.stack,
+        url: url,
+        code: error.code,
+        cause: error.cause
+      });
+      
+      // Re-throw with more context
+      const enhancedError = new Error(`Failed to fetch from Fathom API: ${error.message}`);
+      enhancedError.originalError = error;
+      enhancedError.url = url;
+      enhancedError.code = error.code;
+      throw enhancedError;
+    }
     throw error;
   }
-
-  return response.json();
 }
 
 // Serverless-friendly cache (stored in memory, but resets on cold start)
@@ -148,6 +179,14 @@ async function fetchAllMeetings() {
     }
   } catch (error) {
     console.error('Error fetching meetings:', error);
+    console.error('Error details:', {
+      message: error.message,
+      status: error.status,
+      statusCode: error.statusCode,
+      url: error.url,
+      code: error.code,
+      stack: error.stack
+    });
     throw error;
   }
 
@@ -216,10 +255,31 @@ app.get('/api/meetings', async (req, res) => {
     res.json({ items: serializedMeetings });
   } catch (error) {
     console.error('Error in /api/meetings:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch meetings',
-      message: error.message 
+    console.error('Full error details:', {
+      message: error.message,
+      status: error.status,
+      statusCode: error.statusCode,
+      url: error.url,
+      code: error.code,
+      stack: error.stack
     });
+    
+    // Return more detailed error information
+    const errorResponse = {
+      error: 'Failed to fetch meetings',
+      message: error.message
+    };
+    
+    // Include additional details in development/preview
+    if (process.env.VERCEL_ENV !== 'production') {
+      errorResponse.details = {
+        status: error.status || error.statusCode,
+        url: error.url,
+        code: error.code
+      };
+    }
+    
+    res.status(error.status || error.statusCode || 500).json(errorResponse);
   }
 });
 
@@ -298,13 +358,69 @@ app.get('/api/health', (req, res) => {
   res.json({ 
     status: 'ok',
     timestamp: new Date().toISOString(),
-    environment: 'vercel',
+    environment: process.env.VERCEL_ENV || 'development',
+    apiKeySet: !!process.env.FATHOM_API_KEY,
+    apiBaseUrl: FATHOM_API_BASE,
     cache: {
       hasCache: meetingsCache !== null,
       cacheSize: meetingsCache ? meetingsCache.length : 0,
       cacheAge: cacheTimestamp ? Math.floor((Date.now() - cacheTimestamp) / 1000) : null
     }
   });
+});
+
+/**
+ * GET /api/test-connection
+ * Test endpoint to verify Fathom API connectivity
+ */
+app.get('/api/test-connection', async (req, res) => {
+  try {
+    const apiKey = process.env.FATHOM_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({
+        error: 'FATHOM_API_KEY is not set',
+        message: 'Please set FATHOM_API_KEY in your environment variables'
+      });
+    }
+
+    const testUrl = `${FATHOM_API_BASE}/recordings?limit=1`;
+    console.log(`Testing connection to: ${testUrl}`);
+    
+    try {
+      const response = await fetch(testUrl, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const responseText = await response.text();
+      
+      return res.json({
+        status: 'connection_test',
+        apiBaseUrl: FATHOM_API_BASE,
+        testUrl: testUrl,
+        httpStatus: response.status,
+        httpStatusText: response.statusText,
+        responsePreview: responseText.substring(0, 200),
+        headers: Object.fromEntries(response.headers.entries())
+      });
+    } catch (fetchError) {
+      return res.status(500).json({
+        error: 'Fetch failed',
+        message: fetchError.message,
+        code: fetchError.code,
+        cause: fetchError.cause?.message,
+        stack: process.env.VERCEL_ENV !== 'production' ? fetchError.stack : undefined
+      });
+    }
+  } catch (error) {
+    return res.status(500).json({
+      error: 'Test failed',
+      message: error.message,
+      stack: process.env.VERCEL_ENV !== 'production' ? error.stack : undefined
+    });
+  }
 });
 
 /**
