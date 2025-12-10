@@ -1,6 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import { Fathom } from 'fathom-typescript';
 
 const app = express();
 
@@ -8,12 +7,37 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Initialize Fathom client
-const fathom = new Fathom({
-  security: { 
-    apiKeyAuth: process.env.FATHOM_API_KEY 
+// Fathom API base URL
+const FATHOM_API_BASE = 'https://api.fathom.video/v1';
+
+/**
+ * Make a request to the Fathom API
+ */
+async function fathomRequest(endpoint, options = {}) {
+  const apiKey = process.env.FATHOM_API_KEY;
+  if (!apiKey) {
+    throw new Error('FATHOM_API_KEY is not set');
   }
-});
+
+  const url = `${FATHOM_API_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const error = new Error(`Fathom API error: ${response.status} ${response.statusText}`);
+    error.status = response.status;
+    error.statusCode = response.status;
+    throw error;
+  }
+
+  return response.json();
+}
 
 // Serverless-friendly cache (stored in memory, but resets on cold start)
 // For production, consider using Vercel KV or an external cache
@@ -44,20 +68,46 @@ async function fetchAllMeetings() {
       params.teams = process.env.FATHOM_FILTER_TEAMS.split(',').map(t => t.trim());
     }
 
-    // Initial request
-    let response = await fathom.listMeetings(params);
-    
-    while (response) {
+    // Build query string
+    const queryParams = new URLSearchParams();
+    if (params.calendarInviteesDomains) {
+      params.calendarInviteesDomains.forEach(domain => {
+        queryParams.append('calendar_invitees_domains', domain);
+      });
+    }
+    if (params.recordedBy) {
+      params.recordedBy.forEach(email => {
+        queryParams.append('recorded_by', email);
+      });
+    }
+    if (params.teams) {
+      params.teams.forEach(team => {
+        queryParams.append('teams', team);
+      });
+    }
+    if (params.cursor) {
+      queryParams.append('cursor', params.cursor);
+    }
+
+    let cursor = null;
+    let hasMore = true;
+
+    while (hasMore) {
       try {
+        // Add cursor to query if we have one
+        const query = queryParams.toString();
+        const endpoint = `/recordings${query ? `?${query}` : ''}`;
+        
+        const response = await fathomRequest(endpoint);
+        
         // Extract items from response
-        // The SDK may return items directly or in a result object
         let items = [];
         if (Array.isArray(response)) {
           items = response;
         } else if (response.items) {
           items = response.items;
-        } else if (response.result && response.result.items) {
-          items = response.result.items;
+        } else if (response.data && Array.isArray(response.data)) {
+          items = response.data;
         } else if (response.data && response.data.items) {
           items = response.data.items;
         }
@@ -68,24 +118,13 @@ async function fetchAllMeetings() {
         }
         
         // Check for pagination
-        // The SDK may have a next() method or nextCursor property
-        let hasNext = false;
-        if (typeof response.next === 'function') {
+        cursor = response.next_cursor || response.cursor || response.pagination?.next_cursor || null;
+        hasMore = cursor !== null && cursor !== undefined;
+        
+        if (hasMore) {
+          queryParams.set('cursor', cursor);
           // Small delay to avoid rate limiting
           await new Promise(resolve => setTimeout(resolve, 500));
-          response = await response.next();
-          hasNext = response !== null && response !== undefined;
-        } else if (response.nextCursor) {
-          params.cursor = response.nextCursor;
-          await new Promise(resolve => setTimeout(resolve, 500));
-          response = await fathom.listMeetings(params);
-          hasNext = response !== null && response !== undefined;
-        } else {
-          hasNext = false;
-        }
-        
-        if (!hasNext) {
-          break;
         }
         
         retryCount = 0; // Reset retry count on success
@@ -202,35 +241,26 @@ app.get('/api/meetings/:id/transcript', async (req, res) => {
     
     console.log(`Fetching transcript for meeting ${recordingId}...`);
     
-    // Fetch transcript from Fathom
-    // The SDK method might be getTranscript, getRecordingTranscript, or similar
+    // Fetch transcript from Fathom API
     let transcript;
     try {
-      // Try different possible method names
-      if (typeof fathom.getTranscript === 'function') {
-        transcript = await fathom.getTranscript({ recordingId });
-      } else if (typeof fathom.getRecordingTranscript === 'function') {
-        transcript = await fathom.getRecordingTranscript({ recordingId });
+      const response = await fathomRequest(`/recordings/${recordingId}/transcript`);
+      
+      // Extract transcript from response
+      if (response.transcript) {
+        transcript = response.transcript;
+      } else if (response.data && response.data.transcript) {
+        transcript = response.data.transcript;
+      } else if (response.result && response.result.transcript) {
+        transcript = response.result.transcript;
+      } else if (typeof response === 'string') {
+        transcript = response;
       } else {
-        // Fallback: try direct API call structure
-        transcript = await fathom.listRecordings({ recordingId });
+        transcript = response;
       }
     } catch (apiError) {
-      // If the method doesn't exist or fails, try alternative approach
       console.warn('Primary transcript method failed, trying alternative...');
-      // You may need to adjust this based on actual SDK methods
       throw apiError;
-    }
-    
-    // Extract transcript from response if needed
-    if (transcript && typeof transcript === 'object') {
-      if (transcript.transcript) {
-        transcript = transcript.transcript;
-      } else if (transcript.data && transcript.data.transcript) {
-        transcript = transcript.data.transcript;
-      } else if (transcript.result && transcript.result.transcript) {
-        transcript = transcript.result.transcript;
-      }
     }
     
     if (!transcript) {
