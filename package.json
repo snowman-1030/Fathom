@@ -1,0 +1,30 @@
+{
+  "name": "fathom-meetings-server",
+  "version": "1.0.0",
+  "description": "Node.js server for serving Fathom meeting data to n8n workflow",
+  "main": "api/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "vercel-build": "echo 'No build step required'"
+  },
+  "keywords": [
+    "fathom",
+    "meetings",
+    "api",
+    "n8n",
+    "vercel"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "fathom-typescript": "^1.0.0",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
+
