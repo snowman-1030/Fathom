@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import { fetch as undiciFetch } from 'undici';
 
 const app = express();
 
@@ -8,6 +9,9 @@ app.use(cors());
 app.use(express.json());
 
 // Fathom API base URL (configurable via environment variable)
+// Try different possible endpoints:
+// - https://api.fathom.video/v1 (Fathom Video)
+// - https://api.fathom.ai/external/v1 (Fathom Analytics/Meetings)
 const FATHOM_API_BASE = process.env.FATHOM_API_BASE || 'https://api.fathom.video/v1';
 
 /**
@@ -23,11 +27,13 @@ async function fathomRequest(endpoint, options = {}) {
   
   try {
     console.log(`Making request to: ${url}`);
-    const response = await fetch(url, {
+    // Use undici fetch which is more reliable in serverless environments
+    const response = await undiciFetch(url, {
       ...options,
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
+        'User-Agent': 'Fathom-Meetings-Server/1.0',
         ...options.headers,
       },
     });
@@ -51,19 +57,37 @@ async function fathomRequest(endpoint, options = {}) {
   } catch (error) {
     // Enhance error with more details
     if (error.message && !error.message.includes('Fathom API error')) {
-      console.error(`Fetch error details:`, {
+      const errorDetails = {
         message: error.message,
         stack: error.stack,
         url: url,
         code: error.code,
+        errno: error.errno,
+        syscall: error.syscall,
         cause: error.cause
-      });
+      };
+      
+      console.error(`Fetch error details:`, errorDetails);
+      
+      // Provide more specific error messages based on error code
+      let errorMessage = `Failed to fetch from Fathom API: ${error.message}`;
+      if (error.code === 'ENOTFOUND') {
+        errorMessage = `DNS resolution failed for ${new URL(url).hostname}. Check if the API endpoint is correct.`;
+      } else if (error.code === 'ECONNREFUSED') {
+        errorMessage = `Connection refused to ${url}. The API server may be down or the endpoint is incorrect.`;
+      } else if (error.code === 'ETIMEDOUT' || error.code === 'TIMEOUT') {
+        errorMessage = `Request timeout to ${url}. The API server may be slow or unreachable.`;
+      } else if (error.code === 'CERT_HAS_EXPIRED' || error.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+        errorMessage = `SSL certificate error for ${url}. There may be an issue with the API's SSL certificate.`;
+      }
       
       // Re-throw with more context
-      const enhancedError = new Error(`Failed to fetch from Fathom API: ${error.message}`);
+      const enhancedError = new Error(errorMessage);
       enhancedError.originalError = error;
       enhancedError.url = url;
       enhancedError.code = error.code;
+      enhancedError.errno = error.errno;
+      enhancedError.syscall = error.syscall;
       throw enhancedError;
     }
     throw error;
@@ -387,10 +411,11 @@ app.get('/api/test-connection', async (req, res) => {
     console.log(`Testing connection to: ${testUrl}`);
     
     try {
-      const response = await fetch(testUrl, {
+      const response = await undiciFetch(testUrl, {
         headers: {
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
+          'User-Agent': 'Fathom-Meetings-Server/1.0',
         },
       });
 
@@ -406,13 +431,30 @@ app.get('/api/test-connection', async (req, res) => {
         headers: Object.fromEntries(response.headers.entries())
       });
     } catch (fetchError) {
-      return res.status(500).json({
+      const errorDetails = {
         error: 'Fetch failed',
         message: fetchError.message,
         code: fetchError.code,
+        errno: fetchError.errno,
+        syscall: fetchError.syscall,
         cause: fetchError.cause?.message,
-        stack: process.env.VERCEL_ENV !== 'production' ? fetchError.stack : undefined
-      });
+        url: testUrl
+      };
+      
+      // Add more specific error messages
+      if (fetchError.code === 'ENOTFOUND') {
+        errorDetails.diagnosis = `DNS resolution failed. The hostname ${new URL(testUrl).hostname} cannot be resolved.`;
+      } else if (fetchError.code === 'ECONNREFUSED') {
+        errorDetails.diagnosis = `Connection refused. The API server may be down or the endpoint is incorrect.`;
+      } else if (fetchError.code === 'ETIMEDOUT' || fetchError.code === 'TIMEOUT') {
+        errorDetails.diagnosis = `Request timeout. The API server may be slow or unreachable.`;
+      }
+      
+      if (process.env.VERCEL_ENV !== 'production') {
+        errorDetails.stack = fetchError.stack;
+      }
+      
+      return res.status(500).json(errorDetails);
     }
   } catch (error) {
     return res.status(500).json({

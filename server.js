@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { fetch as undiciFetch } from 'undici';
 
 // Load environment variables
 dotenv.config();
@@ -12,8 +13,8 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Fathom API base URL
-const FATHOM_API_BASE = 'https://api.fathom.video/v1';
+// Fathom API base URL (configurable via environment variable)
+const FATHOM_API_BASE = process.env.FATHOM_API_BASE || 'https://api.fathom.video/v1';
 
 /**
  * Make a request to the Fathom API
@@ -25,23 +26,74 @@ async function fathomRequest(endpoint, options = {}) {
   }
 
   const url = `${FATHOM_API_BASE}${endpoint}`;
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      ...options.headers,
-    },
-  });
+  
+  try {
+    console.log(`Making request to: ${url}`);
+    // Use undici fetch which is more reliable in serverless environments
+    const response = await undiciFetch(url, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'Fathom-Meetings-Server/1.0',
+        ...options.headers,
+      },
+    });
 
-  if (!response.ok) {
-    const error = new Error(`Fathom API error: ${response.status} ${response.statusText}`);
-    error.status = response.status;
-    error.statusCode = response.status;
+    if (!response.ok) {
+      let errorBody = '';
+      try {
+        errorBody = await response.text();
+      } catch (e) {
+        // Ignore error reading body
+      }
+      
+      const error = new Error(`Fathom API error: ${response.status} ${response.statusText}. ${errorBody}`);
+      error.status = response.status;
+      error.statusCode = response.status;
+      error.body = errorBody;
+      throw error;
+    }
+
+    return response.json();
+  } catch (error) {
+    // Enhance error with more details
+    if (error.message && !error.message.includes('Fathom API error')) {
+      const errorDetails = {
+        message: error.message,
+        stack: error.stack,
+        url: url,
+        code: error.code,
+        errno: error.errno,
+        syscall: error.syscall,
+        cause: error.cause
+      };
+      
+      console.error(`Fetch error details:`, errorDetails);
+      
+      // Provide more specific error messages based on error code
+      let errorMessage = `Failed to fetch from Fathom API: ${error.message}`;
+      if (error.code === 'ENOTFOUND') {
+        errorMessage = `DNS resolution failed for ${new URL(url).hostname}. Check if the API endpoint is correct.`;
+      } else if (error.code === 'ECONNREFUSED') {
+        errorMessage = `Connection refused to ${url}. The API server may be down or the endpoint is incorrect.`;
+      } else if (error.code === 'ETIMEDOUT' || error.code === 'TIMEOUT') {
+        errorMessage = `Request timeout to ${url}. The API server may be slow or unreachable.`;
+      } else if (error.code === 'CERT_HAS_EXPIRED' || error.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+        errorMessage = `SSL certificate error for ${url}. There may be an issue with the API's SSL certificate.`;
+      }
+      
+      // Re-throw with more context
+      const enhancedError = new Error(errorMessage);
+      enhancedError.originalError = error;
+      enhancedError.url = url;
+      enhancedError.code = error.code;
+      enhancedError.errno = error.errno;
+      enhancedError.syscall = error.syscall;
+      throw enhancedError;
+    }
     throw error;
   }
-
-  return response.json();
 }
 
 // In-memory cache for meetings (optional - can be replaced with Redis)
